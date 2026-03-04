@@ -1,0 +1,98 @@
+name: Nightly Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Run tests
+        run: go test -v -race ./...
+
+      - name: Set build metadata
+        id: meta
+        run: |
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=nightly-$(date -u +%Y%m%d)-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+          targets=(
+            "linux/amd64"
+            "linux/arm64"
+            "darwin/amd64"
+            "darwin/arm64"
+          )
+          mkdir -p dist
+          for target in "${targets[@]}"; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            output="dist/defer-${os}-${arch}"
+            echo "Building ${os}/${arch}..."
+            GOOS="$os" GOARCH="$arch" go build -ldflags "${LDFLAGS}" -o "${output}" .
+            # Create tarball
+            tar -czf "dist/defer-${os}-${arch}.tar.gz" -C dist "defer-${os}-${arch}"
+            # Generate checksum
+            sha256sum "dist/defer-${os}-${arch}.tar.gz" >> dist/checksums.txt
+          done
+
+      - name: Delete existing nightly release
+        run: gh release delete nightly --yes --cleanup-tag || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create nightly release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          SHA_SHORT: ${{ steps.meta.outputs.sha_short }}
+        run: |
+          gh release create nightly \
+            --title "Nightly Build (${{ steps.meta.outputs.date }})" \
+            --notes "$(cat <<EOF
+          Automated nightly build from \`main\` branch.
+
+          **Commit:** [\`${SHA_SHORT}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})
+          **Version:** \`${VERSION}\`
+
+          ### Downloads
+
+          | Platform | Architecture | File |
+          |----------|-------------|------|
+          | Linux | x86_64 | \`defer-linux-amd64.tar.gz\` |
+          | Linux | ARM64 | \`defer-linux-arm64.tar.gz\` |
+          | macOS | x86_64 | \`defer-darwin-amd64.tar.gz\` |
+          | macOS | ARM64 (Apple Silicon) | \`defer-darwin-arm64.tar.gz\` |
+
+          ### Install
+
+          \`\`\`bash
+          # Download and extract (example: macOS ARM64)
+          curl -sL https://github.com/${GITHUB_REPOSITORY}/releases/download/nightly/defer-darwin-arm64.tar.gz | tar xz
+          mv defer-darwin-arm64 /usr/local/bin/defer
+          \`\`\`
+
+          > **Note:** Nightly builds are automatically replaced on every push to \`main\`.
+          > For stable releases, use tagged versions.
+          EOF
+          )" \
+            --prerelease \
+            dist/*.tar.gz dist/checksums.txt
